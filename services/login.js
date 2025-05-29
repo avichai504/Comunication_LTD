@@ -1,64 +1,94 @@
-const fs = require('fs')
-const path = require('path')
-const { db } = require('../db/db')
-const { hashPassword } = require('../utils/password')
-const { injectFeedback } = require('../utils/htmlInject')
-const { getSecurityConfig } = require('../config/security')
-const { escapeHtml, WHITELIST } = require('../utils/htmlInject')
+// services/login.js
 
-const config = getSecurityConfig()
-const MAX_ATTEMPTS = config.loginAttemptsLimit
-const LOCK_DURATION = 30 * 60 * 1000
-const loginAttempts = {} // memory-only
-const loginPath = path.join(__dirname, '../public/index.html')
+const path = require('path');
+const fs   = require('fs');
+const { db } = require('../db/db');
+const { hashPassword } = require('../utils/password');
+const { getSecurityConfig } = require('../config/security');
+const {
+  WHITELIST,
+  injectValues,
+  injectFeedback
+} = require('../utils/htmlInject');
+
+const config        = getSecurityConfig();
+const MAX_ATTEMPTS  = config.loginAttemptsLimit;
+const LOCK_DURATION = 30 * 60 * 1000; // 30 minutes
+const loginAttempts = {};             // in-memory tracking
+const viewPath      = path.join(__dirname, '../public/index.html');
 
 async function handleLogin(req, res) {
-  const { username, password } = req.body
-  const rawHtml = fs.readFileSync(loginPath, 'utf-8')
+  const rawHtml = fs.readFileSync(viewPath, 'utf-8');
+  const { username, password } = req.body;
 
-  if (!WHITELIST.test(username) || username.length > 30) {
-    return res.status(400).send(injectFeedback(rawHtml, `<p style="color:red;">Login failed.</p>`))
+  // Helper to repopulate form and inject feedback
+  function render(values, msgHtml) {
+    const filled = injectValues(rawHtml, values);
+    return injectFeedback(filled, msgHtml);
   }
 
-  const escapedUsername = escapeHtml(username)
-  const inject = (html) =>
-    injectFeedback(
-      rawHtml.replace('name="username"', `name="username" value="${escapedUsername}"`),
-      html
-    )
+  // A) Required fields
+  if (!username || !password) {
+    return res
+      .status(400)
+      .send(render(
+        { username, password: '' },
+        '<p style="color:red;">Both username and password are required.</p>'
+      ));
+  }
 
-  const user = await db.user.findUnique({ where: { username } })
+  // B) Whitelist & length validation
+  if (
+    username.length > 30   || !WHITELIST.test(username) ||
+    password.length > 50   || !WHITELIST.test(password)
+  ) {
+    return res
+      .status(400)
+      .send(render(
+        { username, password: '' },
+        '<p style="color:red;">Login failed due to invalid input format.</p>'
+      ));
+  }
+
+  // C) Lookup user
+  const user = await db.user.findUnique({ where: { username } });
   if (!user) {
     return res
       .status(400)
-      .send(inject('<p style="color:red;">Username or password is incorrect.</p>'))
+      .send(render(
+        { username, password: '' },
+        '<p style="color:red;">Username or password is incorrect.</p>'
+      ));
   }
 
-  const now = Date.now()
-  const record = loginAttempts[username] || { count: 0, lastFailed: 0 }
-
+  // D) Rate limiting
+  const now    = Date.now();
+  const record = loginAttempts[username] || { count: 0, lastFailed: 0 };
   if (record.count >= MAX_ATTEMPTS && now - record.lastFailed < LOCK_DURATION) {
     return res
       .status(403)
-      .send(
-        inject(
-          '<p style="color:red;">Your account is temporarily locked due to multiple failed attempts. Try again later.</p>'
-        )
-      )
+      .send(render(
+        { username, password: '' },
+        '<p style="color:red;">Your account is temporarily locked due to multiple failed attempts. Try again later.</p>'
+      ));
   }
 
-  const [salt, storedHash] = user.password.split(':')
-  const inputHash = hashPassword(password, salt)
-
-  if (inputHash !== storedHash) {
-    loginAttempts[username] = { count: record.count + 1, lastFailed: now }
+  // E) Verify password
+  const [salt, storedHash] = user.password.split(':');
+  if (hashPassword(password, salt) !== storedHash) {
+    loginAttempts[username] = { count: record.count + 1, lastFailed: now };
+    const attemptsLeft = MAX_ATTEMPTS - (record.count + 1);
     return res
       .status(400)
-      .send(inject('<p style="color:red;">Username or password is incorrect.</p>'))
+      .send(render(
+        { username, password: '' },
+        `<p style="color:red;">Username or password is incorrect. ${attemptsLeft} attempt(s) left.</p>`
+      ));
   }
 
-  loginAttempts[username] = { count: 0, lastFailed: 0 }
-  return res.redirect('/dashboard')
+  // F) Reset failure count & success redirect
+  loginAttempts[username] = { count: 0, lastFailed: 0 };
+  return res.redirect('/dashboard');
 }
 
-module.exports = { handleLogin }
+module.exports = { handleLogin };

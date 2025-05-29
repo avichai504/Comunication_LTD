@@ -1,88 +1,142 @@
-const path = require('path')
-const fs = require('fs')
-const crypto = require('crypto')
-const { db } = require('../db/db')
-const { validatePassword, hashPassword } = require('../utils/password')
-const { getSecurityConfig } = require('../config/security')
+// services/changePassword.js
+
+const path = require('path');
+const fs   = require('fs');
+const crypto = require('crypto');
+const { db } = require('../db/db');
+const { validatePassword, hashPassword } = require('../utils/password');
+const { getSecurityConfig } = require('../config/security');
+const {
+  WHITELIST,
+  escapeHtml,
+  injectValues,
+  injectFeedback
+} = require('../utils/htmlInject');
+
+const viewPath = path.join(__dirname, '../views/change-password.html');
 
 async function handleChangePassword(req, res) {
-  const { email, currentPassword, newPassword } = req.body
+  const rawHtml = fs.readFileSync(viewPath, 'utf-8');
+  const { email, currentPassword, newPassword } = req.body;
 
-  const htmlPath = path.join(__dirname, '../views/change-password.html')
-  const html = fs.readFileSync(htmlPath, 'utf-8')
+  // Helper to repopulate form and inject feedback
+  function render(values, msgHtml) {
+    const filled = injectValues(rawHtml, values);
+    return injectFeedback(filled, msgHtml);
+  }
 
-  const inject = (msg, color = 'red') =>
-    html.replace('<form', `<div id="feedback"><p style="color:${color};">${msg}</p></div><form`)
-
-  // Validate input presence
+  // A) Required fields
   if (!email || !currentPassword || !newPassword) {
     return res
       .status(400)
-      .send(inject('All fields are required (email, current password, new password).'))
+      .send(render(
+        { email, currentPassword, newPassword },
+        '<p style="color:red;">All fields are required.</p>'
+      ));
   }
 
-  // Fetch user #fix: using raw input from user into database, vulernable to sql injection (need to do escaping here)
-  const user = await db.user.findUnique({ where: { email } })
+  // B) Whitelist & length validation
+  if (
+    email.length > 100           || !WHITELIST.test(email) ||
+    currentPassword.length > 50  || !WHITELIST.test(currentPassword) ||
+    newPassword.length > 50      || !WHITELIST.test(newPassword)
+  ) {
+    return res
+      .status(400)
+      .send(render(
+        { email, currentPassword: '', newPassword: '' },
+        '<p style="color:red;">Change password failed due to invalid input format.</p>'
+      ));
+  }
+
+  // C) Lookup user
+  const user = await db.user.findUnique({ where: { email } });
   if (!user) {
-    return res.status(400).send(inject('User not found.'))
+    return res
+      .status(400)
+      .send(render(
+        { email, currentPassword: '', newPassword: '' },
+        '<p style="color:red;">User not found.</p>'
+      ));
   }
 
-  // Validate current password
-  const [salt, storedHash] = user.password.split(':')
+  // D) Verify current password
+  const [salt, storedHash] = user.password.split(':');
   if (!salt || !storedHash) {
-    return res.status(500).send(inject('Stored password format is invalid.'))
+    return res
+      .status(500)
+      .send(render(
+        { email, currentPassword: '', newPassword: '' },
+        '<p style="color:red;">Stored password format is invalid.</p>'
+      ));
+  }
+  if (hashPassword(currentPassword, salt) !== storedHash) {
+    return res
+      .status(400)
+      .send(render(
+        { email, currentPassword: '', newPassword: '' },
+        '<p style="color:red;">Current password is incorrect.</p>'
+      ));
   }
 
-  const inputHash = hashPassword(currentPassword, salt)
-  if (inputHash !== storedHash) {
-    return res.status(400).send(inject('Current password is incorrect.'))
-  }
-
-  // Validate new password strength
-  const errors = validatePassword(newPassword)
+  // E) Validate new password strength
+  const errors = validatePassword(newPassword);
   if (errors.length > 0) {
-    return res.status(400).send(inject(errors.join('<br>')))
+    const list = `<ul style="color:red;">${errors
+      .map(e => `<li>${escapeHtml(e)}</li>`)
+      .join('')}</ul>`;
+    return res
+      .status(400)
+      .send(render(
+        { email, currentPassword: '', newPassword: '' },
+        list
+      ));
   }
 
-  // Check reuse in password history
-  const config = getSecurityConfig()
-  const historyLimit = config.historyLimit || 3
-
-  const isReused = (user.passwordHistory || []).some((old) => {
-    const [oldSalt] = old.split(':') //takes the old salt from old password array
-    const returnConsoleHashedPassword = hashPassword(newPassword, oldSalt) //computes the hashed password
-    const returnSaltedHash = `${oldSalt}:${returnConsoleHashedPassword}` //combines the salt and hashed password
-    return returnSaltedHash === old
-  })
-  const newPasswordHashed = hashPassword(newPassword,salt)
-  const SameSaltedHash = `${salt}:${newPasswordHashed}`
-  isReusedSamePassword = (SameSaltedHash === user.password) 
-  // console.log(SameSaltedHash)
-  // console.log(currentPassword)
-  // console.log(isReusedSamePassword)
-  if (isReused) {//If user reuses his last 3 passwords
-    return res.status(400).send(inject(`You cannot reuse your last ${historyLimit} password(s).`))
+  // F) Check password history reuse
+  const config = getSecurityConfig();
+  const limit = config.historyLimit || 3;
+  const reused = (user.passwordHistory || []).some(old => {
+    const [oldSalt] = old.split(':');
+    return old === `${oldSalt}:${hashPassword(newPassword, oldSalt)}`;
+  });
+  if (reused) {
+    return res
+      .status(400)
+      .send(render(
+        { email, currentPassword: '', newPassword: '' },
+        `<p style="color:red;">You cannot reuse your last ${limit} password(s).</p>`
+      ));
   }
-  if (isReusedSamePassword) //If user enters his current password into new one
-  {
-    return res.status(400).send(inject(`You cannot use your current password.`))
-  }
-  // Hash new password and update history
-  const newSalt = crypto.randomBytes(16).toString('hex')
-  const newHashed = hashPassword(newPassword, newSalt)
-  const newSaltedHash = `${newSalt}:${newHashed}`
 
-  const newHistory = [user.password, ...(user.passwordHistory || [])].slice(0, historyLimit)
+  // Prevent reusing current password
+  if (`${salt}:${hashPassword(newPassword, salt)}` === user.password) {
+    return res
+      .status(400)
+      .send(render(
+        { email, currentPassword: '', newPassword: '' },
+        '<p style="color:red;">You cannot use your current password.</p>'
+      ));
+  }
+
+  // G) Hash new password & update history
+  const newSalt = crypto.randomBytes(16).toString('hex');
+  const newHash = hashPassword(newPassword, newSalt);
+  const saltedHash = `${newSalt}:${newHash}`;
+  const newHistory = [user.password, ...(user.passwordHistory || [])]
+    .slice(0, limit);
 
   await db.user.update({
     where: { email },
-    data: {
-      password: newSaltedHash,
-      passwordHistory: newHistory,
-    },
-  })
+    data: { password: saltedHash, passwordHistory: newHistory }
+  });
 
-  return res.send(inject('Password updated successfully.', 'green'))
+  // H) Success feedback
+  return res
+    .send(render(
+      { email: '', currentPassword: '', newPassword: '' },
+      '<p style="color:green;">Password updated successfully.</p>'
+    ));
 }
 
-module.exports = { handleChangePassword }
+module.exports = { handleChangePassword };

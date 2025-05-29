@@ -1,73 +1,96 @@
-const fs = require('fs')
-const path = require('path')
-const crypto = require('crypto')
-const { db } = require('../db/db')
-const { validatePassword, hashPassword } = require('../utils/password')
-const { injectFeedback, injectValues } = require('../utils/htmlInject')
-const { escapeHtml, WHITELIST } = require('../utils/htmlInject')
+// services/register.js
 
-const registerPath = path.join(__dirname, '../views/register.html')
+const fs     = require('fs');
+const path   = require('path');
+const crypto = require('crypto');
+const { db } = require('../db/db');
+const { validatePassword, hashPassword } = require('../utils/password');
+const {
+  WHITELIST,
+  escapeHtml,
+  injectValues,
+  injectFeedback
+} = require('../utils/htmlInject');
+
+const viewPath = path.join(__dirname, '../views/register.html');
 
 async function handleRegister(req, res) {
-  const rawHtml = fs.readFileSync(registerPath, 'utf-8')
+  const rawHtml = fs.readFileSync(viewPath, 'utf-8');
+  const { username, email, password } = req.body;
 
-  function validUsername(u) {
-    return typeof u === 'string' && u.length > 0 && u.length <= 30 && WHITELIST.test(u)
-  }
-  function validEmail(e) {
-    return typeof e === 'string'
-      && /^[^@\s]+@[^@\s]+$/.test(e)
-      && e.length <= 50
-  }
-  function validPasswordChars(p) {
-    return typeof p === 'string' && p.length > 0 && p.length <= 50 && WHITELIST.test(p)
+  // Helper to repopulate form and inject feedback
+  function render(values, msgHtml) {
+    const filled = injectValues(rawHtml, values);
+    return injectFeedback(filled, msgHtml);
   }
 
-  const { username, email, password } = req.body
-  const inject = html =>
-    injectFeedback(
-      injectValues(
-        rawHtml,
-        { 
-          username: escapeHtml(username || ''),
-          email:    escapeHtml(email    || '')
-        }
-      ),
-      html
-    )
-
-  if (!validUsername(username) || !validEmail(email) || !validPasswordChars(password)) {
-    const msg = '<p style="color:red;">Registration failed.</p>'
-    return res.status(400).send(inject(msg))
+  // A) Required fields
+  if (!username || !email || !password) {
+    return res
+      .status(400)
+      .send(render(
+        { username, email, password },
+        '<p style="color:red;">All fields are required.</p>'
+      ));
   }
 
-  // 1) Password policy
-  const errors = validatePassword(password)
+  // B) Whitelist, length & basic email-format validation
+  const EMAIL_REGEX = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+  if (
+    username.length > 30   || !WHITELIST.test(username) ||
+    email.length > 50      || !WHITELIST.test(email)    || !EMAIL_REGEX.test(email) ||
+    password.length > 50   || !WHITELIST.test(password)
+  ) {
+    return res
+      .status(400)
+      .send(render(
+        { username, email, password: '' },
+        '<p style="color:red;">Registration failed due to invalid input format.</p>'
+      ));
+  }
+
+  // C) Password policy
+  const errors = validatePassword(password);
   if (errors.length > 0) {
-    const msg = `<ul style="color:red;">${errors.map(e => `<li>${escapeHtml(e)}</li>`).join('')}</ul>`
-    return res.status(400).send(inject(msg))
+    const list = `<ul style="color:red;">${
+      errors.map(e => `<li>${escapeHtml(e)}</li>`).join('')
+    }</ul>`;
+    return res
+      .status(400)
+      .send(render(
+        { username, email, password: '' },
+        list
+      ));
   }
 
-  // 2) Uniqueness
+  // D) Uniqueness check
   const exists = await db.user.findFirst({
     where: { OR: [{ username }, { email }] }
-  })
+  });
   if (exists) {
-    const msg = '<p style="color:red;">Registration failed.</p>'
-    return res.status(400).send(inject(msg))
+    return res
+      .status(400)
+      .send(render(
+        { username, email, password: '' },
+        '<p style="color:red;">Username or email already exists.</p>'
+      ));
   }
 
-  // 3) Create user
-  const salt = crypto.randomBytes(16).toString('hex')
-  const hashed = hashPassword(password, salt)
-  const saltedHash = `${salt}:${hashed}`
+  // E) Create user (salt + HMAC-SHA256)
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hashed = hashPassword(password, salt);
+  const saltedHash = `${salt}:${hashed}`;
 
   await db.user.create({
     data: { username, email, password: saltedHash }
-  })
+  });
 
-  const success = '<p style="color:green;">Registration successful!</p>'
-  return res.send(inject(success))
+  // F) Success feedback
+  return res
+    .send(render(
+      { username: '', email: '', password: '' },
+      '<p style="color:green;">Registration successful!</p>'
+    ));
 }
 
-module.exports = { handleRegister }
+module.exports = { handleRegister };
