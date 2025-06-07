@@ -59,7 +59,7 @@ async function handleForgotPassword(req, res) {
   }
 
   // D) Generate secure random 6‐hex‐digit code (avoids “SHA-1”)
-  const code = crypto.createHash('sha1').update(Math.random().toString()).digest('hex').slice(0, 6)
+  const code = crypto.randomBytes(3).toString('hex');
 
   // E) Store and email the code
   await db.user.update({
